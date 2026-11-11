@@ -1238,7 +1238,8 @@ class CIPDApi(recipe_api.RecipeApi):
     the absolute path to the executable within that directory.
 
     This operation is idempotent, and will only run steps to download the
-    package if it hasn't already been installed in the same build.
+    package if it hasn't already been installed in the same build. If an
+    install fails, the next call for the same package retries it.
 
     Args:
       * package - The full name of the CIPD package.
@@ -1251,7 +1252,8 @@ class CIPDApi(recipe_api.RecipeApi):
     Returns a Path to the executable.
 
     Future-safe; Multiple concurrent calls for the same (package, version) will
-    block on a single ensure step.
+    block on a single ensure step, and all of them get its result. That step
+    runs in the context of the call that started it, including any deadline.
     """
 
     check_type("package", package, str)
@@ -1286,7 +1288,18 @@ class CIPDApi(recipe_api.RecipeApi):
         _install_package_thread, __name='recipe_engine/cipd: ' + name
       )
 
-    self._installed_tool_package_futures[cache_key].result()
+    future = self._installed_tool_package_futures[cache_key]
+    try:
+      future.result()
+    except Exception:
+      # The install greenlet inherits the first caller's context, including
+      # any deadline from `time.timeout`, so its failure may say nothing about
+      # whether a later call would succeed. Evict it so later calls retry. The
+      # identity check keeps a late waiter on the failed future from evicting
+      # a retry that another caller has already started.
+      if self._installed_tool_package_futures.get(cache_key) is future:
+        del self._installed_tool_package_futures[cache_key]
+      raise
 
     if executable_path is None:
       executable_path = basename

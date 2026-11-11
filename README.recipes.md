@@ -78,6 +78,7 @@
   * [change_verifier:tests/search](#recipes-change_verifier_tests_search)
   * [cipd:examples/full](#recipes-cipd_examples_full)
   * [cipd:tests/ensure_file](#recipes-cipd_tests_ensure_file)
+  * [cipd:tests/ensure_tool_retry](#recipes-cipd_tests_ensure_tool_retry)
   * [cipd:tests/platform](#recipes-cipd_tests_platform)
   * [commit_position:examples/full](#recipes-commit_position_examples_full)
   * [context:examples/full](#recipes-context_examples_full)
@@ -1313,7 +1314,8 @@ Given a package named "name/of/some_exe/${platform}" and version
 the absolute path to the executable within that directory.
 
 This operation is idempotent, and will only run steps to download the
-package if it hasn't already been installed in the same build.
+package if it hasn't already been installed in the same build. If an
+install fails, the next call for the same package retries it.
 
 Args:
   * package - The full name of the CIPD package.
@@ -1326,7 +1328,8 @@ Args:
 Returns a Path to the executable.
 
 Future-safe; Multiple concurrent calls for the same (package, version) will
-block on a single ensure step.
+block on a single ensure step, and all of them get its result. That step
+runs in the context of the call that started it, including any deadline.
 
 &emsp; **@property**<br>&mdash; **def [executable](/recipe_modules/cipd/api.py#386)(self):**
 
@@ -1373,7 +1376,7 @@ Args:
 
 Returns a Pin for the downloaded package.
 
-&emsp; **@property**<br>&mdash; **def [platform](/recipe_modules/cipd/api.py#1308)(self):**
+&emsp; **@property**<br>&mdash; **def [platform](/recipe_modules/cipd/api.py#1321)(self):**
 
 Returns the CIPD platform string, equivalent to '${platform}'.
 
@@ -5286,6 +5289,12 @@ Generates response Runs for a test.
 
 
 &mdash; **def [RunSteps](/recipe_modules/cipd/tests/ensure_file.py#28)(api: DEPS):**
+### *recipes* / [cipd:tests/ensure\_tool\_retry](/recipe_modules/cipd/tests/ensure_tool_retry.py)
+
+[DEPS](/recipe_modules/cipd/tests/ensure_tool_retry.py#21): [cipd](#recipe_modules-cipd), [step](#recipe_modules-step)
+
+
+&mdash; **def [RunSteps](/recipe_modules/cipd/tests/ensure_tool_retry.py#31)(api: DEPS):**
 ### *recipes* / [cipd:tests/platform](/recipe_modules/cipd/tests/platform.py)
 
 [DEPS](/recipe_modules/cipd/tests/platform.py#25): [cipd](#recipe_modules-cipd), [platform](#recipe_modules-platform), [step](#recipe_modules-step)
