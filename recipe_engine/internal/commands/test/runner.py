@@ -765,65 +765,6 @@ class RunnerThread(gevent.Greenlet):
     self._description_queue = description_queue
     self._outcome_queue = outcome_queue
 
-  @classmethod
-  def make_pool(
-    cls,
-    recipe_deps: recipe_deps_mod.RecipeDeps,
-    description_queue: gevent.queue.UnboundQueue,
-    outcome_queue: gevent.queue.UnboundQueue,
-    is_train: bool,
-    collect_coverage: bool,
-    jobs: int,
-  ) -> tuple[str | None, list[RunnerThread]]:
-    """Returns a pool (list) of started RunnerThread instances.
-
-    Each RunnerThread owns a `recipes.py test _runner` subprocess and
-    coordinates communication to and from that subprocess.
-
-    This makes `jobs` runners.
-
-    Args:
-
-      * recipe_deps (RecipeDeps)
-      * description_queue (gevent.queue.Queue) - The queue to pull Description
-        messages from to feed to the runner subprocess.
-      * outcome_queue (gevent.queue.Queue) - The queue to push Outcome messages
-        sourced from the runner subprocess.
-      * is_train (bool) - Whether or not the runner subprocess should train
-        (write) expectation files to disk. If False will not write/delete
-        anything on the filesystem.
-      * collect_coverage (bool) - Whether or not to collect coverage. May be
-        false if the user specified a test filter.
-      * jobs (int) - The number of workers to use for running tests.
-
-    Returns List[RunnerThread].
-    """
-    if collect_coverage:
-      cov_dir = tempfile.mkdtemp('.recipe_test_coverage')
-      cov_file: Callable[[int], str | None] = lambda tid: os.path.join(
-        cov_dir, 'thread-%d.coverage' % tid
-      )
-    else:
-      cov_dir = None
-      cov_file = lambda tid: None
-
-    # We assign import coverage to (only) the first runner subprocess; there's
-    # no need to duplicate this work to all runners.
-    pool = [
-      cls(
-        recipe_deps,
-        description_queue,
-        outcome_queue,
-        is_train,
-        cov_file(i),
-        cover_module_imports=(i == 0),
-      )
-      for i in range(jobs)
-    ]
-    for thread in pool:
-      thread.start()
-    return cov_dir, pool
-
   # pylint: disable=method-hidden
   def _run(self) -> None:
     try:
@@ -907,3 +848,92 @@ class RunnerThread(gevent.Greenlet):
       # Sending ourselves down the pipe lets the main process know that we've
       # quit so it can remove us from the live threads.
       self._outcome_queue.put(self)
+
+
+class RunnerPool:
+  """A pool of RunnerThreads that grows as tests are found, up to `jobs`.
+
+  Every runner subprocess spends about a second importing the engine and
+  protos before it can run anything, so starting `jobs` (by default the CPU
+  count) runners up front wastes a lot of CPU when only a few tests run, e.g.
+  with `--filter` or in small repos. Starting one runner per discovered test
+  still gives a large repo all `jobs` runners almost immediately.
+  """
+
+  def __init__(
+    self,
+    recipe_deps: recipe_deps_mod.RecipeDeps,
+    description_queue: gevent.queue.UnboundQueue,
+    outcome_queue: gevent.queue.UnboundQueue,
+    is_train: bool,
+    collect_coverage: bool,
+    jobs: int,
+  ) -> None:
+    """
+    Args:
+
+      * recipe_deps (RecipeDeps)
+      * description_queue (gevent.queue.Queue) - The queue to pull Description
+        messages from to feed to the runner subprocesses.
+      * outcome_queue (gevent.queue.Queue) - The queue to push Outcome messages
+        sourced from the runner subprocesses.
+      * is_train (bool) - Whether or not the runner subprocesses should train
+        (write) expectation files to disk. If False will not write/delete
+        anything on the filesystem.
+      * collect_coverage (bool) - Whether or not to collect coverage. May be
+        false if the user specified a test filter.
+      * jobs (int) - The maximum number of runners to start.
+    """
+    self._recipe_deps = recipe_deps
+    self._description_queue = description_queue
+    self._outcome_queue = outcome_queue
+    self._is_train = is_train
+    self._jobs = jobs
+    self._reserved = 0
+    self.cov_dir = (
+      tempfile.mkdtemp('.recipe_test_coverage') if collect_coverage else None
+    )
+    self.threads: list[RunnerThread] = []
+    # Always start one runner right away: it imports the engine while the main
+    # process runs GenTests, and it records module import coverage even when
+    # there are no tests at all.
+    self._start_thread()
+
+  def _start_thread(self) -> None:
+    tid = len(self.threads)
+    cov_file = None
+    if self.cov_dir:
+      cov_file = os.path.join(self.cov_dir, 'thread-%d.coverage' % tid)
+    # We assign import coverage to (only) the first runner subprocess; there's
+    # no need to duplicate this work to all runners.
+    thread = RunnerThread(
+      self._recipe_deps,
+      self._description_queue,
+      self._outcome_queue,
+      self._is_train,
+      cov_file,
+      cover_module_imports=(tid == 0),
+    )
+    thread.start()
+    self.threads.append(thread)
+
+  def reserve(self) -> None:
+    """Records that one more test will be queued.
+
+    Starts another runner if that's allowed. This is separate from `put` so
+    that tests whose queueing is deferred (e.g. to run recent failures first)
+    still get their runners started while GenTests is running.
+    """
+    self._reserved += 1
+    if len(self.threads) < min(self._jobs, self._reserved):
+      self._start_thread()
+
+  def put(self, test_desc: runner_pb.Description) -> None:
+    """Queues a test (previously counted with `reserve`) to run."""
+    self._description_queue.put(test_desc)
+
+  def close(self) -> None:
+    """Tells every runner to exit once the queued tests are done."""
+    # Each runner exits after taking one None "poison pill" off the queue.
+    for _ in self.threads:
+      self._description_queue.put(None)

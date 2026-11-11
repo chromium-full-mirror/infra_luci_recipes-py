@@ -33,7 +33,7 @@ def _push_tests(
   test_filter: test_name.Filter,
   is_train: bool,
   main_repo: recipe_deps_mod.RecipeRepo,
-  description_queue: gevent.queue.UnboundQueue,
+  pool: runner_mod.RunnerPool,
   recent_fails: Collection[str],
 ) -> list[str] | set[str]:
   """
@@ -68,7 +68,7 @@ def _push_tests(
     if not test_filter.full_name(f'{recipe.name}.{test_case.name}'):
       return
 
-    description_queue.put(
+    pool.put(
       runner_pb.Description(recipe_name=recipe.name, test_name=test_case.name)
     )
 
@@ -94,6 +94,8 @@ def _push_tests(
     try:
       for test_case in recipe.gen_tests():  # User code, could raise
         assert test_case.name is not None
+        if test_filter.full_name(f'{recipe.name}.{test_case.name}'):
+          pool.reserve()
         full_name = recipe.full_name.split('::')[-1] + '.' + test_case.name
         if len(recent_fails) == 0 or full_name in recent_fails:
           push_test(recipe, test_case)
@@ -164,7 +166,6 @@ def _run(
     show_durations,
   )
 
-  cov_dir = None
   # We use a non-suffixed file in a temp directory to avoid polluting the
   # checkout and avoid sharing issues.
   total_cov_file = tempfile.NamedTemporaryFile(
@@ -175,11 +176,9 @@ def _run(
     config_file=False, data_file=total_cov_file.name, data_suffix=False
   )
   total_cov.save()  # Force to ensure the coverage data file is created.
+  pool: runner_mod.RunnerPool | None = None
   try:
-    # in case of crash; don't want this undefined in finally clause.
-    live_threads: list[runner_mod.RunnerThread] = []
-
-    cov_dir, all_threads = runner_mod.RunnerThread.make_pool(
+    pool = runner_mod.RunnerPool(
       recipe_deps,
       description_queue,
       outcome_queue,
@@ -187,16 +186,16 @@ def _run(
       collect_coverage=not test_filter,
       jobs=jobs,
     )
-    live_threads[:] = all_threads
 
     unused_expectation_files = _push_tests(
       test_filter,
       is_train,
       main_repo,
-      description_queue,
+      pool,
       fail_tracker.recent_fails,
     )
     test_results.unused_expectation_files.extend(unused_expectation_files)
+    live_threads = list(pool.threads)
 
     def execute_queue() -> bool:
       has_fail = False
@@ -239,7 +238,7 @@ def _run(
       if (test_filter or (stop and has_fail)) is False:
         data_paths = [
           t.cov_file
-          for t in all_threads
+          for t in pool.threads
           if t.cov_file and os.path.isfile(t.cov_file)
         ]
         if data_paths:
@@ -247,9 +246,7 @@ def _run(
 
       return has_fail
 
-    # Put None poison pill for each thread.
-    for thread in all_threads:
-      description_queue.put(None)
+    pool.close()
 
     has_fail = execute_queue()
     print()
@@ -262,11 +259,12 @@ def _run(
       reporter.final_report(total_cov, test_results)
 
   finally:
-    for thread in live_threads:
+    # Killing a runner that already finished is a no-op.
+    for thread in pool.threads if pool else ():
       thread.kill()
       thread.join()
-    if cov_dir:
-      shutil.rmtree(cov_dir, ignore_errors=True)
+    if pool and pool.cov_dir:
+      shutil.rmtree(pool.cov_dir, ignore_errors=True)
     total_cov.erase()
     try:
       os.remove(total_cov_file.name)
